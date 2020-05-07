@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Epic terrain</title>
+    <script type="vertex-shader" id="terrainVertexShader">
+		attribute vec3 a_position;
+        attribute vec3 a_normal;
+
+        varying vec3 normal;
+        varying vec3 worldPosition;
+
+        uniform mat4 u_matrixM;
+        uniform mat4 u_matrixV;
+        uniform mat4 u_matrixP;
+
+        uniform mat3 u_matrixInverseTranspose;
+
+        void main() {
+            normal = u_matrixInverseTranspose * a_normal;
+            worldPosition = (u_matrixM * vec4(a_position, 1)).xyz;
+            vec4 pos = u_matrixP * u_matrixV * u_matrixM * vec4 (a_position, 1);
+            gl_Position = pos;
+        }
+    </script>
+    <script type="fragment-shader" id="terrainFragmentShader">
+        precision highp float;
+
+        varying vec3 normal;
+        varying vec3 worldPosition;
+
+        uniform vec4 u_tint;
+        uniform vec3 u_lightDirection;
+        uniform vec3 u_lightColor;
+        uniform vec3 u_ambientColor;
+
+        // texture samplers
+        uniform sampler2D u_topTexture;
+        uniform sampler2D u_sideTexture;
+        uniform sampler2D u_snowTexture;
+        uniform sampler2D u_biomeTexture;
+        uniform sampler2D u_sandTopTexture;
+        uniform sampler2D u_sandSideTexture;
+
+        //implementation of triplanar mapping
+        vec4 triplanarColor () {
+            // uv adjustment so biome texturing doesn't repeat
+            vec2 uvCoordinates = (worldPosition.xz - 10.0)/20.0;
+
+            // biome blending value
+            float biomeColor = texture2D(u_biomeTexture, uvCoordinates).r;
+
+            // calculate colors for sand biome
+            vec3 sandColorY = texture2D(u_sandTopTexture, worldPosition.xz).rgb;
+            vec3 sandColorX = texture2D(u_sandSideTexture, worldPosition.zy).rgb;
+            vec3 sandColorZ = texture2D(u_sandSideTexture, worldPosition.xy).rgb;
+
+            // calculate colors for grass biome
+            vec3 grassColorY = texture2D(u_topTexture, worldPosition.xz).rgb;
+            vec3 grassColorX = texture2D(u_sideTexture, worldPosition.zy).rgb;
+            vec3 grassColorZ = texture2D(u_sideTexture, worldPosition.xy).rgb;
+
+            // biome blending
+            vec3 colorY = sandColorY * biomeColor + grassColorY * (1.0 - biomeColor);
+            vec3 colorX = sandColorX * biomeColor + grassColorX * (1.0 - biomeColor);
+            vec3 colorZ = sandColorZ * biomeColor + grassColorZ * (1.0 - biomeColor);
+            vec3 snowColor = texture2D(u_snowTexture, worldPosition.xz).rgb;
+
+            // adjustments for blend weights
+            float plateauSize = 0.5;
+            float transitionSpeed = 8.0;
+            float snowStart = .6;
+            float snowSpeed = 8.0;
+
+            // remove negative values from blend weights
+            vec3 blendWeights = abs(normal);
+            blendWeights.y -= plateauSize;
+            blendWeights = pow(max(blendWeights, 0.0), vec3(transitionSpeed));
+
+            // ensuring that blend weights sum up to 1
+            float n = blendWeights.x + blendWeights.y + blendWeights.z;
+            blendWeights /= n;
+
+            // height blend factor (for snow)
+            float yBlending = max(0.0, min((worldPosition.y - snowStart) * snowSpeed, 1.0));
+            vec3 finalY = snowColor * yBlending + colorY * (1.0 - yBlending);
+
+            vec4 textureColor = vec4(colorX * blendWeights.x +
+                        finalY * blendWeights.y +
+                        colorZ * blendWeights.z, 1);
+
+            return textureColor;
+        }
+
+        void main(void) {
+            float diffuse = max(0.0, dot(normal, -u_lightDirection));
+            vec3 diffuseColor = u_lightColor * diffuse;
+
+            vec3 ambientDiffuse = u_ambientColor + diffuseColor;
+            ambientDiffuse = clamp(ambientDiffuse, vec3(0.0,0.0,0.0), vec3(1.0, 1.0, 1.0));
+
+            vec4 textureColor = triplanarColor();
+            vec4 combinedColor = textureColor * u_tint;
+
+            vec3 finalColor = ambientDiffuse * combinedColor.xyz;
+            gl_FragColor = vec4(finalColor, combinedColor.a);
+        }
+
+    </script>
+
+</head>
+<body>
+	<canvas width="500" height="500" id="webgl-canvas"></canvas>
+
+    <script src="webgl-debug.js"></script>
+    <script src="math.js"></script>
+    <script src="gl-utils.js"></script>
+    <script src="transform.js"></script>
+    <script src="shader.js"></script>
+    <script src="renderloop.js"></script>
+    <script src="model.js"></script>
+    <script src="primitives.js"></script>
+    <script src="input.js"></script>
+    <script src="objparser.js"></script>
+    <script src="camera.js"></script>
+
+    <script type="text/javascript">
+        "use strict"; // use strict javascript compiling
+
+        //--------------------------------------------------
+        // Global Caches
+        //--------------------------------------------------
+        var MeshCache = {}; // here all mesh objects are stored, see GLUtils.createMeshVAO() for details on how a mesh is added.
+        var TextureCache = {}; // texture objects - see gl-utils.loadTexture()
+
+        // -----------------------------------------
+        // Global variables
+        // -----------------------------------------
+        var gl;
+        var canvas;
+        var renderLoop;
+        var g_terrainShader;
+        var g_camera;
+        var g_cameraController;
+        var g_terrain;
+
+        var g_lightingData = {
+            lightDirection: new Vector3(-1, -1, -0.5).normalize(),
+            lightColor: new Vector3(.9, .8, .7),
+            ambientColor: new Vector3(.1, .1, .1)
+        }
+
+        function setup(){
+            canvas = document.getElementById("webgl-canvas");
+            gl = GLUtils.createWebGL2Instance(canvas, true);
+            gl.clearColor(0.85, 0.95, 0.9, 1); // set clear color (RGBA)
+            gl.fitScreen();
+            gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LEQUAL);
+            Input.initialize(canvas);
+        }
+
+        function init(){
+            g_terrainShader = new Shader(gl, GLUtils.getDomShaderSrc("terrainVertexShader"), GLUtils.getDomShaderSrc("terrainFragmentShader"));
+            g_terrainShader.useLighting = true;
+            g_camera = new PerspectiveCamera(gl, 45, 0.1, 1000, canvas.width / canvas.height);
+            g_cameraController = new OrbiterCameraController(canvas, g_camera);
+
+            // loading textures
+            GLUtils.loadTexture(gl, "grass", "resources/grass.png");
+            GLUtils.loadTexture(gl, "rock", "resources/rock.png");
+            GLUtils.loadTexture(gl, "snow", "resources/snow.png");
+            GLUtils.loadTexture(gl, "biome", "resources/biomes.png");
+            GLUtils.loadTexture(gl, "sand", "resources/lava.png");
+            GLUtils.loadTexture(gl, "sandstone", "resources/redstone.jpg");
+
+            let terrainMat = {tint: [1, 1, 1, 1]};
+
+            g_terrain = new Model(new Transform(), OBJLoader.getMesh(gl, "terrain", "resources/terrain.obj"), terrainMat);
+
+            renderLoop = new RenderLoop(draw).start();
+
+        }
+
+        function draw(deltaTime){
+            Input.update();
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            g_cameraController.update();
+
+            g_terrain.update();
+            g_terrain.render(gl, g_terrainShader, g_camera, g_lightingData);
+
+        }
+
+        window.addEventListener("load", function() {
+            setup();
+            init();
+        });
+
+    </script>
+</body>
+</html>
